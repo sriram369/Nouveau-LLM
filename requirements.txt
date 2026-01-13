@@ -1,0 +1,4 @@
+groq
+SpeechRecognition
+edge-tts
+pyaudio

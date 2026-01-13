@@ -1,0 +1,6 @@
+key.txt
+key
+.venv/
+__pycache__/
+*.json
+*.mp3
