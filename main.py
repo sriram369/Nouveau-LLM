@@ -5,6 +5,7 @@ import json
 import time
 import platform
 import subprocess
+import tempfile
 from datetime import datetime
 from groq import Groq
 import speech_recognition as sr
@@ -24,34 +25,56 @@ def load_key():
         sys.exit(1)
 
 GROQ_API_KEY = load_key()
-VOICE_NAME = "en-US-AriaNeural"
+# English Voice
+VOICE_EN = "en-US-AriaNeural"
+# Spanish Voice (Mexican Spanish)
+VOICE_ES = "es-MX-DaliaNeural"
+
 MODEL_ID = "llama-3.3-70b-versatile" 
+WHISPER_ID = "distil-whisper-large-v3-en" # Note: Groq's "distil" is English focused, but often catches Spanish. 
+# For true multilingual on Groq, we ideally want 'whisper-large-v3' if available, 
+# but let's try to use the translation capabilities or sticking to standard whisper if available.
+# Actually, for Groq, let's use the versatile whisper if possible or standard translation. 
+# Re-checking Groq docs: 'distil-whisper-large-v3-en' is English only. 
+# We should use 'whisper-large-v3' for multilingual.
+WHISPER_MODEL = "whisper-large-v3" 
 
 client = Groq(api_key=GROQ_API_KEY)
 rec = sr.Recognizer()
 mic = sr.Microphone()
 
+def detect_language_and_pick_voice(text):
+    """Simple check to swap accent if response is Spanish."""
+    # Common Spanish words to trigger the switch
+    spanish_triggers = ["hola", "gracias", "ayuda", "estoy", "donde", "sí", "claro", "momento"]
+    
+    # Check if a significant portion of words are Spanish triggers
+    count = sum(1 for word in text.lower().split() if word.strip(".,!?") in spanish_triggers)
+    
+    if count > 0 or "¿" in text or "ñ" in text:
+        return VOICE_ES
+    return VOICE_EN
+
 def speak(text):
-    """Speaks text, works on both Windows and Mac."""
+    """Speaks text, automatically switching accent for Spanish."""
     
-    # Clean hidden commands so she doesn't say them out loud
     clean_text = text.replace("[TERMINATE_CALL]", "").replace("[TRANSFER_CALL]", "")
-    
-    if not clean_text.strip():
-        return 
+    if not clean_text.strip(): return 
         
     print(f"HAILEY: {clean_text}")
+    
+    # Smart Voice Switching
+    selected_voice = detect_language_and_pick_voice(clean_text)
     
     output_file = "hailey_response.mp3"
     
     async def generate_audio():
-        communicate = edge_tts.Communicate(clean_text, VOICE_NAME)
+        communicate = edge_tts.Communicate(clean_text, selected_voice)
         await communicate.save(output_file)
 
     try:
         asyncio.run(generate_audio())
         
-        # Cross-Platform Player
         current_os = platform.system()
         if current_os == "Darwin":  # Mac
             os.system(f"afplay {output_file}")
@@ -63,25 +86,42 @@ def speak(text):
     except Exception as e:
         print(f"Voice Error: {e}")
 
-def listen():
-    """Listens with patience (doesn't cut you off)."""
+def listen_with_whisper():
+    """Records audio and uses Groq Whisper for Multilingual understanding."""
     print("\n(Listening...)")
     with mic as source:
-        rec.pause_threshold = 1.0  # Wait 1 seconds of silence
-        rec.energy_threshold = 300 
-        rec.dynamic_energy_threshold = True 
+        rec.pause_threshold = 1.0
         rec.adjust_for_ambient_noise(source, duration=0.5)
         
         try:
-            audio = rec.listen(source, timeout=5, phrase_time_limit=20)
-            print("(Thinking...)")
-            return rec.recognize_google(audio)
+            # Record audio locally
+            audio_data = rec.listen(source, timeout=10, phrase_time_limit=20)
+            print("(Transcribing...)")
+            
+            # Save temporary file for Whisper
+            with open("temp_audio.wav", "wb") as f:
+                f.write(audio_data.get_wav_data())
+            
+            # Send to Groq Whisper (Multilingual)
+            with open("temp_audio.wav", "rb") as file:
+                transcription = client.audio.transcriptions.create(
+                    file=("temp_audio.wav", file.read()),
+                    model=WHISPER_MODEL, 
+                    response_format="json",
+                    temperature=0.0
+                )
+            
+            return transcription.text
+            
         except sr.WaitTimeoutError:
-            return "" # Silence
-        except sr.UnknownValueError:
-            return "" # Unintelligible
-        except sr.RequestError:
             return ""
+        except Exception as e:
+            # Fallback to Google if Whisper fails (Google is decent at simple Spanish)
+            print(f"Whisper Error: {e}, trying Google fallback...")
+            try:
+                return rec.recognize_google(audio_data)
+            except:
+                return ""
 
 def load_brain():
     try:
@@ -111,14 +151,16 @@ def save_ticket(conversation_history, status="Routine"):
     HISTORY:
     {conversation_history}
     
-    Return ONLY valid JSON with fields: 
+    Return ONLY valid JSON.
+    NOTE: Even if conversation was Spanish, translate values to English.
+    Fields: 
     - caller_name
     - caller_phone
     - location_address
     - equipment_id
     - issue_description
     - is_emergency (boolean)
-    - resolution_status (Set this to: "{status}")
+    - resolution_status ("{status}")
     """
     
     try:
@@ -133,7 +175,6 @@ def save_ticket(conversation_history, status="Routine"):
         if start != -1:
             clean = clean[start:end]
             
-        # Unique filename using timestamp down to the second
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         filename = f"ticket_{timestamp}.json"
         
@@ -144,66 +185,52 @@ def save_ticket(conversation_history, status="Routine"):
     except Exception as e:
         print(f"Failed to save ticket: {e}")
 
-# --- THE NEW INFINITE DISPATCH LOOP ---
+# --- SERVER LOOP ---
 def run_dispatch_server():
     print("================================================")
-    print("   NOUVEAU AI DISPATCH SERVER: ONLINE           ")
-    print("   (Press Ctrl+C to stop the server)            ")
+    print("   NOUVEAU AI DISPATCH SERVER (BILINGUAL)       ")
     print("================================================")
 
     while True:
-        # 1. Reset Memory for New Call
         print("\n📞 [SYSTEM READY] Waiting for incoming call...")
-        # Simulate a "Ring" delay or wait for user to hit Enter to start demo
         input("--> Press ENTER to simulate an incoming call...") 
         
         chat_history = [{"role": "system", "content": load_brain()}]
         
-        # 2. Start Conversation
         greeting = "Nouveau Elevator, this is Hailey. How can I help?"
         speak(greeting)
         chat_history.append({"role": "assistant", "content": greeting})
 
-        # 3. Conversation Loop
         call_active = True
         while call_active:
-            user_input = listen()
+            # CHANGED: Use Whisper instead of Google
+            user_input = listen_with_whisper()
             
-            # If silence, just wait (don't send empty text to AI)
-            if not user_input: 
+            if not user_input.strip(): 
                 continue
             
             print(f"👤 CALLER: {user_input}")
             chat_history.append({"role": "user", "content": user_input})
             
-            # Get AI Response
             response_text = ask_groq(chat_history)
             
-            # --- LOGIC GATES ---
             if "[TERMINATE_CALL]" in response_text:
                 speak(response_text)
                 print("\n🔴 [CALL ENDED]")
                 save_ticket(str(chat_history), status="Completed")
-                call_active = False # Break inner loop
+                call_active = False
                 
             elif "[TRANSFER_CALL]" in response_text:
                 speak(response_text)
                 print("\n⚠️ [EMERGENCY TRANSFER INITIATED]")
-                print(">> DIALING HUMAN OPERATOR (555-0199)...")
-                # Simulate transfer beep
-                time.sleep(1) 
-                print(">> CONNECTED.")
                 save_ticket(str(chat_history), status="Escalated")
-                call_active = False # Break inner loop
-                
+                call_active = False
             else:
-                # Normal reply
                 speak(response_text)
                 chat_history.append({"role": "assistant", "content": response_text})
         
-        # 4. End of Call Cleanup
         print("------------------------------------------------")
-        print("♻️  Resetting system for next caller in 3 seconds...")
+        print("♻️  Resetting system...")
         time.sleep(3)
 
 if __name__ == "__main__":
@@ -211,3 +238,4 @@ if __name__ == "__main__":
         run_dispatch_server()
     except KeyboardInterrupt:
         print("\n[Server Shutdown]")
+        
